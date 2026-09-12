@@ -123,7 +123,6 @@ def ai_chat_endpoint():
         return jsonify({'error': 'Празно съобщение'}), 400
 
     try:
-        # Извикване на вашата Llama
         response = ai_client.chat.completions.create(
             model="local-model",
             messages=[
@@ -133,13 +132,29 @@ def ai_chat_endpoint():
             ],
             temperature=0.7
         )
-        bot_reply = response.choices.message.content
+
+        # КОРИГИРАН РЕД: Безопасно извличане на отговора, независимо дали е обект или речник
+        if hasattr(response, 'choices') and len(response.choices) > 0:
+            choice = response.choices[0]
+            # Проверяваме дали вътрешната структура е обект или речник (dict)
+            if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                bot_reply = choice.message.content
+            elif isinstance(choice, dict) and 'message' in choice:
+                bot_reply = choice['message'].get('content', '')
+            else:
+                # Ако llama.cpp върне по-опростен формат директно в обекта
+                bot_reply = getattr(choice, 'text', str(choice))
+        else:
+            # Алтернативно извличане, ако структурата е чист речник (dict)
+            bot_reply = response['choices'][0]['message']['content']
+
         return jsonify({'reply': bot_reply})
 
     except Exception as e:
-        print(f"Грешка с llama.cpp: {e}")
-        return jsonify({'error': 'Локалният модел не отговори'}), 500
 
+
+        print(f"Грешка с llama.cpp: {e}")
+    return jsonify({'error': 'Локалният модел не отговори правилно'}), 500
 
 if __name__ == '__main__':
     # Стартираме уеб сървъра на порт 5005
