@@ -37,20 +37,23 @@ stripe listen --forward-to http://127.0.0.1:5005/webhooks/payment
 
 ## 4. Конфигурирайте и стартирайте
 
-В терминала, от който ще стартирате Flask, задайте следните променливи. Стойностите по-долу са заместители, които трябва да замените локално:
+В папката с `app.py` копирайте `.env.example` като `.env` (не презаписвайте съществуващ `.env`):
 
 ```bash
-export STRIPE_SECRET_KEY='sk_test_REPLACE_ME'
-export STRIPE_WEBHOOK_SECRET='whsec_REPLACE_ME'
-export STRIPE_PRICE_ID='price_REPLACE_ME'
-export STRIPE_LIVE_MODE=0
-export PUBLIC_URL='http://127.0.0.1:5005'
-export COOKIE_SECURE=0
-export AI_DATA_DIR="$PWD/instance-stripe-test"
+cp -n .env.example .env
+chmod 600 .env
+nano .env
+```
+
+Попълнете локално `STRIPE_SECRET_KEY=sk_test_...`, `STRIPE_WEBHOOK_SECRET=whsec_...` от listener-а и `STRIPE_PRICE_ID=price_...`. Оставете `STRIPE_LIVE_MODE=0`, `COOKIE_SECURE=0` и `AI_DATA_DIR=instance-stripe-test` за теста. След запазване:
+
+```bash
 python app.py
 ```
 
-Тестът използва отделна папка, затова регистрирайте тестов потребител. Съществуващите ви данни в `instance/` остават непокътнати. Променливите важат за текущия терминал. Приложението не зарежда `.env` автоматично. При systemd/gunicorn ги задайте в средата на съответната услуга.
+`load_dotenv()` чете `.env` до `app.py` преди всички настройки. Относителният `AI_DATA_DIR` също е спрямо тази папка. Вече зададени environment променливи имат предимство (`override=False`). Ако сте използвали старите export команди, отворете нов терминал или премахнете съответните променливи с `unset`, за да се използват стойностите от файла. Рестартирайте приложението след промяна на `.env`.
+
+Тестовата база е отделна от оригиналната `instance/`; регистрирайте тестов потребител. `.env.example` съдържа празни Stripe полета, които оставят плащанията изключени до попълване. `.gitignore` изключва `.env`, базите и сесийните ключове, но не премахва файлове, които вече са качени в GitHub.
 
 ## 5. Направете тест през самото приложение
 

@@ -19,10 +19,16 @@ from datetime import timedelta
 import click
 import requests
 import stripe
+from dotenv import load_dotenv
 from flask import Flask, g, jsonify, redirect, render_template_string, request, session
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
+
+BASE = Path(__file__).resolve().parent
+# Load only the .env next to this app, regardless of the launch directory.
+# Explicit process/service settings take precedence over the file.
+load_dotenv(dotenv_path=BASE / '.env', override=False)
 
 # Explicit API version keeps invoice/charge fields stable across SDK upgrades.
 STRIPE_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
@@ -34,8 +40,8 @@ stripe.api_key = STRIPE_KEY
 stripe.api_version = '2024-06-20'
 stripe.max_network_retries = 1
 
-BASE = Path(__file__).resolve().parent
-DATA = Path(os.environ.get('AI_DATA_DIR', str(BASE / 'instance'))).resolve()
+DATA = Path(os.environ.get('AI_DATA_DIR') or 'instance').expanduser()
+DATA = (DATA if DATA.is_absolute() else BASE / DATA).resolve()
 DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
 DB_PATH = DATA / 'portal.sqlite3'  # New schema: never overwrite the old chat_memory.db.
 # Atomic creation; never use a public/default Flask secret.

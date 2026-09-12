@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 sandbox = tempfile.TemporaryDirectory()
+os.environ['PYTHON_DOTENV_DISABLED'] = '1'  # Never load the operator's secrets in tests.
 os.environ['AI_DATA_DIR'] = sandbox.name
 for key in ('STRIPE_SECRET_KEY','STRIPE_WEBHOOK_SECRET','STRIPE_PRICE_ID'):
     os.environ[key] = ''
