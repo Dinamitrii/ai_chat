@@ -128,7 +128,7 @@ python test_app.py
 
 Тестовете използват временна SQLite база и симулирани backend отговори. Покриват пароли/CSRF, сесии, изолация на акаунти и изображения, history/reset/facts, квоти, timeout резерви, tokenizer failure, едновременни заявки, paid лимити и отказ на payment stub-а. Те не генерират изображения и не изпращат заявки към реалните AI услуги.
 
-При подготовката са изпълнени 14 теста успешно, както и Python синтактична проверка. Реалните llama.cpp и sd-server не са извиквани; съвместимостта на конкретната инсталирана версия с tokenizer/template endpoints остава за първото локално пускане.
+При подготовката са изпълнени 13 теста успешно, както и Python синтактична проверка. Реалните llama.cpp и sd-server не са извиквани; съвместимостта на конкретната инсталирана версия с tokenizer/template endpoints остава за първото локално пускане.
 
 Използвана официална документация:
 
@@ -136,5 +136,3 @@ python test_app.py
 - [Werkzeug password hashing](https://werkzeug.palletsprojects.com/en/stable/utils/)
 - [llama.cpp server API](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 - [stable-diffusion.cpp server API](https://github.com/leejet/stable-diffusion.cpp/blob/master/examples/server/api.md)
-
-Промяна за отзивчивост: изпратеното съобщение се показва веднага; непроменената image галерия не се зарежда повторно след чат. При прекалено дълъг контекст се премахва половината от старите двойки на стъпка само от изпращания prompt, за да се намалят tokenizer заявките. Пълната история остава в SQLite. Отговорът все още се връща наведнъж (без streaming). След него UI показва отделно времето за подготовка и за модела; няма измерено ускорение на реалния backend.

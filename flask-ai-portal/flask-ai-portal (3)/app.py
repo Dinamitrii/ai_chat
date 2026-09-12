@@ -1,5 +1,5 @@
 """Local AI portal. Python 3.10+, Linux; see README.md for operation and billing.
-No payment activation is implemented: the webhook deliberately fails closed.
+Stripe subscriptions are disabled until server-side keys and a monthly Price are configured.
 """
 import base64
 import fcntl
@@ -18,10 +18,21 @@ from datetime import timedelta
 
 import click
 import requests
+import stripe
 from flask import Flask, g, jsonify, redirect, render_template_string, request, session
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
+
+# Explicit API version keeps invoice/charge fields stable across SDK upgrades.
+STRIPE_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_WEBHOOK = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+STRIPE_PRICE = os.environ.get('STRIPE_PRICE_ID', '')
+STRIPE_LIVE = os.environ.get('STRIPE_LIVE_MODE', '0') == '1'
+PUBLIC_URL = os.environ.get('PUBLIC_URL', 'http://127.0.0.1:5005').rstrip('/')
+stripe.api_key = STRIPE_KEY
+stripe.api_version = '2024-06-20'
+stripe.max_network_retries = 1
 
 BASE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('AI_DATA_DIR', str(BASE / 'instance'))).resolve()
@@ -123,6 +134,11 @@ with app.app_context():
     CREATE TABLE IF NOT EXISTS auth_attempts (
       bucket TEXT NOT NULL, created INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS auth_window ON auth_attempts(bucket,created);
+    CREATE TABLE IF NOT EXISTS billing_accounts (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id), customer_id TEXT UNIQUE,
+      customer_key TEXT NOT NULL UNIQUE, checkout_key TEXT, checkout_id TEXT,
+      valid_until INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'none',
+      livemode INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS payment_events (
       provider TEXT NOT NULL, event_id TEXT NOT NULL, user_id INTEGER REFERENCES users(id),
       verified_at TEXT, payload_hash TEXT, PRIMARY KEY(provider,event_id));
@@ -159,6 +175,8 @@ def digest(value):
 @app.before_request
 def protect():
     g.user = None
+    # Expiration is enforced locally even when a renewal webhook is delayed.
+    db().execute("UPDATE users SET plan='free' WHERE plan='paid' AND id IN (SELECT user_id FROM billing_accounts WHERE valid_until<=? OR livemode<>?)", (int(time.time()), int(STRIPE_LIVE)))
     token = session.get('auth')
     if isinstance(token, str):
         g.user = db().execute('''SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id
@@ -185,7 +203,7 @@ def secure_headers(response):
     response.headers['Content-Security-Policy'] = (
         "default-src 'self'; script-src 'nonce-" + g.get('nonce', '') +
         "'; style-src 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; "
-        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://checkout.stripe.com https://billing.stripe.com")
     return response
 
 
@@ -496,29 +514,214 @@ def get_image(image_id):
     return app.response_class(row['png'], mimetype='image/png')
 
 
+def stripe_ready():
+    return bool(STRIPE_KEY and STRIPE_WEBHOOK and STRIPE_PRICE)
+
+
+def require_stripe():
+    if not stripe_ready():
+        raise Problem('Stripe още не е конфигуриран.', 503)
+    if not STRIPE_KEY.startswith('sk_live_' if STRIPE_LIVE else 'sk_test_'):
+        raise Problem('Stripe key и STRIPE_LIVE_MODE не съвпадат.', 503)
+    if STRIPE_LIVE and (not PUBLIC_URL.startswith('https://') or not app.config['SESSION_COOKIE_SECURE']):
+        raise Problem('Live плащанията изискват HTTPS и COOKIE_SECURE=1.', 503)
+
+
+def stripe_id(value):
+    return value.get('id') if isinstance(value, dict) else value
+
+
+@app.errorhandler(stripe.StripeError)
+def stripe_error(error):
+    app.logger.warning('Stripe request failed: %s', type(error).__name__)
+    return problem(Problem('Stripe временно не е достъпен. Опитайте отново.', 502))
+
+
+def expected_price():
+    price = stripe.Price.retrieve(STRIPE_PRICE)
+    recurring = price.get('recurring') or {}
+    if (price.get('livemode') != STRIPE_LIVE or not price.get('active') or
+            price.get('type') != 'recurring' or recurring.get('interval') != 'month' or
+            recurring.get('interval_count') != 1 or recurring.get('usage_type') != 'licensed' or
+            type(price.get('unit_amount')) is not int or price['unit_amount'] <= 0):
+        raise Problem('Настройте активна месечна Stripe Price с фиксирана положителна цена.', 503)
+    return price
+
+
+def billing_snapshot(account):
+    """Read CURRENT provider state, not the state embedded in an old webhook.
+
+    Policy: only a fully paid, non-refunded card invoice grants access. No trials,
+    coupons, prorations, out-of-band payments or grace period in this first version.
+    Partial refunds/disputes revoke access as well. Configure the Portal for
+    cancellation/payment-method updates only, with cancellation at period end.
+    """
+    if account['livemode'] != int(STRIPE_LIVE):
+        raise Problem('Използвайте отделна AI_DATA_DIR за Stripe test и live.', 503)
+    price = expected_price()
+    subscriptions = stripe.Subscription.list(customer=account['customer_id'], status='all', limit=100)
+    valid_until, state, existing = 0, 'none', False
+    for sub in subscriptions.auto_paging_iter():
+        if (sub.get('livemode') != STRIPE_LIVE or stripe_id(sub.get('customer')) != account['customer_id'] or
+                sub.get('metadata', {}).get('portal_user') != str(account['user_id'])):
+            continue
+        items = sub.get('items', {}).get('data', [])
+        if len(items) != 1 or items[0].get('quantity') != 1 or stripe_id(items[0].get('price')) != STRIPE_PRICE:
+            continue
+        status = sub.get('status', 'unknown')
+        if status not in ('canceled', 'incomplete_expired'):
+            existing = True
+        if state == 'none':
+            state = status
+        if status != 'active' or not sub.get('latest_invoice'):
+            continue
+        invoice = stripe.Invoice.retrieve(stripe_id(sub['latest_invoice']), expand=['charge'])
+        charge = invoice.get('charge')
+        if isinstance(charge, str):
+            charge = stripe.Charge.retrieve(charge)
+        if (invoice.get('livemode') != STRIPE_LIVE or stripe_id(invoice.get('customer')) != account['customer_id'] or
+                stripe_id(invoice.get('subscription')) != sub['id'] or invoice.get('status') != 'paid' or
+                invoice.get('paid_out_of_band') or invoice.get('currency') != price['currency'] or
+                invoice.get('amount_paid', 0) < price['unit_amount'] or
+                not charge or charge.get('livemode') != STRIPE_LIVE or not charge.get('paid') or
+                not charge.get('captured') or charge.get('disputed') or charge.get('amount_refunded', 0) != 0 or
+                charge.get('currency') != price['currency'] or charge.get('amount', 0) < price['unit_amount']):
+            continue
+        until = sub.get('current_period_end', 0)
+        if type(until) is int and until > int(time.time()):
+            valid_until = max(valid_until, until)
+            state = 'paid'
+    return valid_until, state, existing
+
+
+def save_billing(account, snapshot):
+    until, status, _ = snapshot
+    db().execute('UPDATE billing_accounts SET valid_until=?,status=?,livemode=? WHERE user_id=?',
+                 (until, status, int(STRIPE_LIVE), account['user_id']))
+    db().execute('UPDATE users SET plan=? WHERE id=?',
+                 ('paid' if until > int(time.time()) else 'free', account['user_id']))
+
+
 @app.get('/upgrade')
 def upgrade():
-    return page('Upgrade', UPGRADE, stats=usage(), paid_chat=PAID_CHAT, paid_images=PAID_IMAGES)
+    return page('Upgrade', UPGRADE, stats=usage(), paid_chat=PAID_CHAT, paid_images=PAID_IMAGES,
+                stripe_enabled=stripe_ready(), stripe_live=STRIPE_LIVE)
 
 
 @app.post('/api/checkout')
 def checkout():
-    raise Problem('Плащанията още не са свързани. Не е извършено плащане и планът не е променен.', 503)
+    require_stripe()
+    uid = g.user['id']
+    with locked('billing-' + str(uid)):
+        price = expected_price()
+        with transaction() as c:
+            c.execute('INSERT OR IGNORE INTO billing_accounts(user_id,customer_key,livemode) VALUES(?,?,?)', (uid, secrets.token_urlsafe(24), int(STRIPE_LIVE)))
+        account = db().execute('SELECT * FROM billing_accounts WHERE user_id=?', (uid,)).fetchone()
+        if not account['customer_id']:
+            customer = stripe.Customer.create(email=g.user['email'], metadata={'portal_user': str(uid)},
+                                              idempotency_key=account['customer_key'])
+            db().execute('UPDATE billing_accounts SET customer_id=? WHERE user_id=?', (customer['id'], uid))
+            account = db().execute('SELECT * FROM billing_accounts WHERE user_id=?', (uid,)).fetchone()
+        snapshot = billing_snapshot(account)
+        with transaction():
+            save_billing(account, snapshot)
+        if snapshot[2]:
+            raise Problem('Вече има абонамент. Използвайте „Управлявай абонамента“.', 409)
+        if account['checkout_id']:
+            current = stripe.checkout.Session.retrieve(account['checkout_id'])
+            if current.get('status') == 'open':
+                return redirect(current['url'], code=303)
+            if current.get('status') == 'complete':
+                previous_sub = stripe.Subscription.retrieve(stripe_id(current['subscription'])) if current.get('subscription') else {}
+                if previous_sub.get('status') not in ('canceled', 'incomplete_expired'):
+                    raise Problem('Плащането се проверява. Натиснете „Провери плащането“.', 409)
+            db().execute('UPDATE billing_accounts SET checkout_key=NULL,checkout_id=NULL WHERE user_id=?', (uid,))
+            account = db().execute('SELECT * FROM billing_accounts WHERE user_id=?', (uid,)).fetchone()
+        key = account['checkout_key'] or secrets.token_urlsafe(24)
+        db().execute('UPDATE billing_accounts SET checkout_key=? WHERE user_id=?', (key, uid))
+        checkout_session = stripe.checkout.Session.create(
+            mode='subscription', customer=account['customer_id'], payment_method_types=['card'],
+            line_items=[{'price': price['id'], 'quantity': 1}], client_reference_id=str(uid),
+            subscription_data={'metadata': {'portal_user': str(uid)}},
+            success_url=PUBLIC_URL + '/upgrade?checkout=success', cancel_url=PUBLIC_URL + '/upgrade?checkout=cancel',
+            idempotency_key=key)
+        db().execute('UPDATE billing_accounts SET checkout_id=? WHERE user_id=?', (checkout_session['id'], uid))
+        return redirect(checkout_session['url'], code=303)
+
+
+@app.post('/api/billing/portal')
+def billing_portal():
+    require_stripe()
+    account = db().execute('SELECT * FROM billing_accounts WHERE user_id=?', (g.user['id'],)).fetchone()
+    if not account or not account['customer_id']:
+        raise Problem('Все още нямате Stripe абонамент.')
+    portal = stripe.billing_portal.Session.create(customer=account['customer_id'], return_url=PUBLIC_URL + '/upgrade')
+    return redirect(portal['url'], code=303)
+
+
+@app.post('/api/billing/sync')
+def billing_sync():
+    require_stripe()
+    with locked('billing-' + str(g.user['id'])):
+        account = db().execute('SELECT * FROM billing_accounts WHERE user_id=?', (g.user['id'],)).fetchone()
+        if account and account['customer_id']:
+            snapshot = billing_snapshot(account)
+            with transaction():
+                save_billing(account, snapshot)
+    return redirect('/upgrade', code=303)
 
 
 @app.post('/webhooks/payment')
 def payment_webhook():
-    """Integration boundary -- intentionally no plan UPDATE here.
+    require_stripe()
+    raw = request.get_data(cache=False)
+    try:
+        event = stripe.Webhook.construct_event(raw, request.headers.get('Stripe-Signature', ''), STRIPE_WEBHOOK, tolerance=300)
+    except (ValueError, stripe.SignatureVerificationError):
+        raise Problem('Invalid Stripe signature.', 400)
+    if event.get('livemode') != STRIPE_LIVE:
+        raise Problem('Stripe event mode mismatch.', 400)
+    supported = {'checkout.session.completed', 'checkout.session.async_payment_succeeded',
+                 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted',
+                 'invoice.paid', 'invoice.payment_failed', 'charge.refunded',
+                 'charge.dispute.created', 'charge.dispute.closed'}
+    if event['type'] not in supported:
+        return jsonify(received=True, ignored=True)
+    obj = event['data']['object']
+    customer = stripe_id(obj.get('customer'))
+    if event['type'].startswith('charge.dispute.'):
+        charge = stripe.Charge.retrieve(stripe_id(obj['charge']))
+        customer = stripe_id(charge.get('customer'))
+    account = db().execute('SELECT * FROM billing_accounts WHERE customer_id=?', (customer,)).fetchone()
+    if not account:
+        # Customer.create can deliver an event before the local mapping is committed.
+        # Retry rather than silently lose a payment belonging to this app.
+        if customer:
+            remote = stripe.Customer.retrieve(customer)
+            if remote.get('metadata', {}).get('portal_user'):
+                raise Problem('Customer mapping not committed yet; retry.', 503)
+        return jsonify(received=True, ignored=True)
+    with locked('billing-' + str(account['user_id'])):
+        if db().execute("SELECT 1 FROM payment_events WHERE provider='stripe' AND event_id=?", (event['id'],)).fetchone():
+            return jsonify(received=True, duplicate=True)
+        snapshot = billing_snapshot(account)
+        with transaction() as c:
+            save_billing(account, snapshot)
+            c.execute("INSERT INTO payment_events(provider,event_id,user_id,verified_at,payload_hash) VALUES('stripe',?,?,CURRENT_TIMESTAMP,?)",
+                      (event['id'], account['user_id'], hashlib.sha256(raw).hexdigest()))
+    return jsonify(received=True)
 
-    Replace only after implementing provider SDK signature verification over raw body,
-    timestamp tolerance, server-to-server payment retrieval and validation of:
-    live/test mode, settled status, amount, currency, configured product/price and a
-    server-created checkout->user mapping (never trust an incoming user_id alone).
-    In ONE SQLite transaction insert a UNIQUE provider/event_id and update the plan.
-    Handle duplicates idempotently; handle refunds, cancellations and expiration.
-    Do not acknowledge (2xx) events until they have been verified and committed.
-    """
-    raise Problem('Payment provider is not configured; no event accepted.', 503)
+
+@app.cli.command('sync-billing')
+def sync_all_billing():
+    """Recover missed webhooks by rechecking all mapped Stripe customers."""
+    require_stripe()
+    for account in db().execute('SELECT * FROM billing_accounts WHERE customer_id IS NOT NULL').fetchall():
+        with locked('billing-' + str(account['user_id'])):
+            snapshot = billing_snapshot(account)
+            with transaction():
+                save_billing(account, snapshot)
+        click.echo(str(account['user_id']) + ': ' + snapshot[1])
 
 
 @app.cli.command('pending-usage')
@@ -639,7 +842,13 @@ AUTH = '''<section class="auth"><p>Free: 5 успешни изображения
 UPGRADE = '''<section class="upgrade"><h2>Free → Paid</h2><p>Free включва 5 успешни изображения общо и 1500 входни + изходни чат токена общо. Историята и фактите, изпратени към модела, също се броят при всяка заявка.</p>
 <p>Използван чат: {{ stats.chat.used }} · изображения: {{ stats.image.used }}.</p>
 <p>Paid чат лимит: {{ paid_chat or 'неограничен' }}; изображения: {{ paid_images or 'неограничени' }}. Конфигурираните лимити са общи за живота на акаунта.</p>
-<p><strong>Плащанията още не са активирани.</strong> Цена и доставчик не са зададени. Никой бутон не активира платен план.</p><form action="/api/checkout" method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}"><button disabled>Плащането още не е налично</button></form></section>'''
+{% if stripe_enabled %}
+<p>{{ 'Месечен абонамент. Точната цена и валута се показват в Stripe преди потвърждение.' if stripe_live else 'ТЕСТОВ РЕЖИМ — използвайте само тестова карта. Няма истинско плащане.' }}</p>
+{% if request.args.get('checkout') == 'success' %}<p>Плащането се проверява. Планът се активира след потвърждение от Stripe. Натиснете „Провери плащането“.</p>{% endif %}
+<form action="/api/checkout" method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}"><button>Абонирай се чрез Stripe</button></form>
+<form action="/api/billing/portal" method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}"><button>Управлявай абонамента</button></form>
+<form action="/api/billing/sync" method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}"><button>Провери плащането</button></form>
+{% else %}<p>Stripe още не е конфигуриран. Плащанията са изключени.</p>{% endif %}</section>'''
 HOME = '''<div id="quota" class="quota"></div><p id="status" role="status" aria-live="polite"></p>
 <div class="workspace">
 <section class="sd-panel" aria-label="Генериране на изображения">

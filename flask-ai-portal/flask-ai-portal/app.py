@@ -374,7 +374,6 @@ def count_prompt(messages):
 
 @app.post('/api/chat')
 def chat():
-    started = time.perf_counter()
     message = text_field(body(), 'message', 12000)
     with user_lock():
         left = remaining('chat')
@@ -393,16 +392,12 @@ def chat():
                 room = ceiling - prompt - 16
                 if room >= min(64, MAX_REPLY) or len(messages) <= 2:
                     break
-                # Bound preflight round trips: remove half of the old pairs per retry.
-                # Full history stays in SQLite; only the submitted context is shortened.
-                pairs = (len(messages) - 2) // 2
-                del messages[1:1 + 2 * max(1, (pairs + 1) // 2)]
+                del messages[1:3]  # Drop an oldest complete user/assistant pair, only from context.
             if room < 1:
                 raise Problem('Недостатъчен контекст/квота за съобщението и фактите. Съкратете ги или надградете.', 402 if left is not None else 400)
             maximum = min(MAX_REPLY, room)
         except (requests.RequestException, ValueError, KeyError, TypeError):
             raise Problem('llama.cpp не може да преброи токените чрез /apply-template и /tokenize. Квотата не е таксувана.', 502)
-        prepared = time.perf_counter()
         event = reserve('chat', prompt + 16 + maximum)
         try:
             result = llama_post('/v1/chat/completions', {'model': MODEL, 'messages': messages,
@@ -420,9 +415,7 @@ def chat():
             finish(event, 'success', pt + ct, pt, ct,
                    'Backend exceeded reservation' if pt + ct > prompt + 16 + maximum else '')
             c.executemany('INSERT INTO messages(conversation_id,role,content) VALUES(?,?,?)', [(cid, 'user', message), (cid, 'assistant', reply)])
-        return jsonify(reply=reply, usage=usage(), timings={
-            'prepare_seconds': round(prepared - started, 3),
-            'generation_seconds': round(time.perf_counter() - prepared, 3)})
+        return jsonify(reply=reply, usage=usage())
 
 
 def image_png(raw, require_size=False):
@@ -670,22 +663,9 @@ const csrf={{ session.csrf|tojson }};
 const el=id=>document.getElementById(id);
 async function api(url,data){const r=await fetch(url,data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(data)});const d=await r.json();if(!r.ok){if(r.status===401)location.href='/login';throw new Error((d.error||'Грешка')+(r.status===402?' Вижте Upgrade горе.':''));}return d;}
 function node(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;}
-let pendingChat=null, imageSignature=null;
-function showPending(){if(!pendingChat)return;el('messages').append(node('div',pendingChat,'message user'),node('div','Изпращане / изчакване на модела…','message assistant'));el('messages').scrollTop=el('messages').scrollHeight;}
-async function refresh(){const s=await api('/api/state');el('quota').textContent=['chat','image'].map((k,i)=>(i?'Изображения: ':'Чат токени: ')+s.usage[k].used+' / '+(s.usage[k].limit??'∞')).join(' · ');el('messages').replaceChildren(...s.messages.map(m=>node('div',m.content,'message '+m.role)));if(!s.messages.length)el('messages').append(node('div','Здравейте! Аз съм Вашият локален AI асистент. С какво мога да помогна? 🛠️','message assistant'));showPending();el('messages').scrollTop=el('messages').scrollHeight;el('facts').replaceChildren();for(const f of s.facts){const li=node('li',f.content),b=node('button','Изтрий');b.onclick=()=>run(b,async()=>{await api('/api/facts',{delete_id:f.id});await refresh();});li.append(b);el('facts').append(li);}const signature=JSON.stringify(s.images);if(signature===imageSignature)return;imageSignature=signature;el('images').replaceChildren();if(!s.images.length)el('images').textContent='Резултатът ще се появи тук.';for(const im of s.images){const img=node('img',undefined,'preview');img.src='/api/images/'+im.id;img.alt=im.prompt;const a=node('a','Изтегли PNG');a.href=img.src;a.download='image-'+im.id+'.png';el('images').append(img,node('p',im.prompt),a);}}
+async function refresh(){const s=await api('/api/state');el('quota').textContent=['chat','image'].map((k,i)=>(i?'Изображения: ':'Чат токени: ')+s.usage[k].used+' / '+(s.usage[k].limit??'∞')).join(' · ');el('messages').replaceChildren(...s.messages.map(m=>node('div',m.content,'message '+m.role)));if(!s.messages.length)el('messages').append(node('div','Здравейте! Аз съм Вашият локален AI асистент. С какво мога да помогна? 🛠️','message assistant'));el('messages').scrollTop=el('messages').scrollHeight;el('facts').replaceChildren();for(const f of s.facts){const li=node('li',f.content),b=node('button','Изтрий');b.onclick=()=>run(b,async()=>{await api('/api/facts',{delete_id:f.id});await refresh();});li.append(b);el('facts').append(li);}el('images').replaceChildren();if(!s.images.length)el('images').textContent='Резултатът ще се появи тук.';for(const im of s.images){const img=node('img',undefined,'preview');img.src='/api/images/'+im.id;img.alt=im.prompt;const a=node('a','Изтегли PNG');a.href=img.src;a.download='image-'+im.id+'.png';el('images').append(img,node('p',im.prompt),a);}}
 async function run(button,fn){button.disabled=true;el('status').textContent='Обработване…';try{await fn();el('status').textContent='Готово.';}catch(e){el('status').textContent=e.message;}finally{button.disabled=false;}}
-for(const id of ['fact','image'])el(id).onsubmit=e=>{e.preventDefault();const form=e.currentTarget;run(form.querySelector('button[type=submit]')||form.querySelector('button'),async()=>{const data=Object.fromEntries(new FormData(form));if(id==='image'){for(const k of ['steps','cfg_scale','seed','strength'])data[k]=Number(data[k]??0.7);const file=el('init').files[0];if(file){if(file.size>10*1024*1024)throw Error('Изображението трябва да е до 10 MB.');data.init_image=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(Error('Файлът не се прочете.'));reader.readAsDataURL(file);});}}await api(id==='chat'?'/api/chat':id==='fact'?'/api/facts':'/api/generate',data);if(id!=='image')form.reset();await refresh();});};
-el('chat').onsubmit=async e=>{
- e.preventDefault();if(pendingChat)return;
- const form=e.currentTarget,input=form.elements.message,button=form.querySelector('button');
- const message=input.value.trim();if(!message)return;
- pendingChat=message;input.value='';button.disabled=true;el('reset').disabled=true;showPending();
- const started=performance.now();
- try{const result=await api('/api/chat',{message});pendingChat=null;await refresh();
- const t=result.timings;el('status').textContent=t?`Отговор за ${((performance.now()-started)/1000).toFixed(1)} сек. · Подготовка: ${t.prepare_seconds} сек. · Модел: ${t.generation_seconds} сек.`:'Готово.';
- }catch(error){pendingChat=null;if(!input.value)input.value=message;try{await refresh();}catch(_){}el('status').textContent=error.message;}
- finally{pendingChat=null;button.disabled=false;el('reset').disabled=false;input.focus();}
-};
+for(const id of ['chat','fact','image'])el(id).onsubmit=e=>{e.preventDefault();const form=e.currentTarget;run(form.querySelector('button[type=submit]')||form.querySelector('button'),async()=>{const data=Object.fromEntries(new FormData(form));if(id==='image'){for(const k of ['steps','cfg_scale','seed','strength'])data[k]=Number(data[k]??0.7);const file=el('init').files[0];if(file){if(file.size>10*1024*1024)throw Error('Изображението трябва да е до 10 MB.');data.init_image=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(Error('Файлът не се прочете.'));reader.readAsDataURL(file);});}}await api(id==='chat'?'/api/chat':id==='fact'?'/api/facts':'/api/generate',data);if(id!=='image')form.reset();await refresh();});};
 let previewUrl;
 function updateInit(){if(previewUrl)URL.revokeObjectURL(previewUrl);const file=el('init').files[0];el('init-preview').hidden=el('clear-init').hidden=!file;el('strength').disabled=!file;if(file){previewUrl=URL.createObjectURL(file);el('init-preview').src=previewUrl;}else el('init-preview').removeAttribute('src');}
 el('init').onchange=updateInit;el('clear-init').onclick=()=>{el('init').value='';updateInit();};

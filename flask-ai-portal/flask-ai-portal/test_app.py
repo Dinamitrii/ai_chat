@@ -187,18 +187,6 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(stats['chat']['used'], 120)
         self.assertEqual(stats['image']['used'], 1)
 
-    def test_long_history_preparation_is_bounded(self):
-        with m.app.app_context():
-            cid = m.db().execute('SELECT id FROM conversations WHERE user_id=1').fetchone()[0]
-            m.db().executemany('INSERT INTO messages(conversation_id,role,content) VALUES(?,?,?)',
-                              [(cid, role, 'old message') for _ in range(50) for role in ('user', 'assistant')])
-        with patch.object(m, 'count_prompt', side_effect=lambda messages: len(messages) * 100) as counter, patch.object(m, 'llama_post', side_effect=self.mock_llama):
-            response = self.post('/api/chat', {'message': 'Hello'})
-            self.assertEqual(response.status_code, 200, response.json)
-            self.assertLessEqual(counter.call_count, 7)
-            self.assertIn('generation_seconds', response.json['timings'])
-        self.assertEqual(len(self.client.get('/api/state').json['messages']), 102)
-
     def test_paid_limit_configuration(self):
         with m.app.app_context():
             m.db().execute("UPDATE users SET plan='paid'")  # Test fixture, never a public route.
